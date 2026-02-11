@@ -31,7 +31,7 @@ CORS(app)
 
 # Configuration from environment
 G5K_USER = os.environ.get('G5K_USER')
-G5K_SITE = os.environ.get('G5K_SITE', 'sophia')
+G5K_SITE = os.environ.get('G5K_SITE', 'sophia')  # Site name: sophia, nancy, lyon, etc.
 G5K_SSH_KEY = os.environ.get('G5K_SSH_KEY')  # Base64-encoded private key
 G5K_PORT = 5000  # Port where persistence_server.py runs on G5K
 LOCAL_PORT = 15000  # Local port for SSH tunnel
@@ -84,10 +84,9 @@ def start_tunnel():
             print("ERROR: G5K_USER not set")
             return False
         
-        # Build SSH command
-        # G5K frontend hostnames: fnancy, flyon, frennes, etc.
-        g5k_frontend = f"f{G5K_SITE}"
-        jump_host = "access.grid5000.fr"
+        # G5K connection: access.grid5000.fr -> site (e.g., sophia)
+        # From access machine, sites are just "sophia", "nancy", etc.
+        access_host = "access.grid5000.fr"
         
         cmd = [
             'ssh',
@@ -100,13 +99,14 @@ def start_tunnel():
             '-o', 'ExitOnForwardFailure=yes',
             '-o', 'ConnectTimeout=30',
             '-i', key_file_path,
-            '-J', f'{G5K_USER}@{jump_host}',
-            f'{G5K_USER}@{g5k_frontend}'
+            '-J', f'{G5K_USER}@{access_host}',  # Jump through access
+            f'{G5K_USER}@{G5K_SITE}'  # Then to site (sophia, nancy, etc.)
         ]
         
-        print(f"Starting SSH tunnel to {G5K_SITE}...")
-        print(f"  Command: ssh -J {G5K_USER}@{jump_host} {G5K_USER}@{g5k_frontend}")
-        print(f"  Local port: {LOCAL_PORT} -> remote port: {G5K_PORT}")
+        print(f"Starting SSH tunnel...")
+        print(f"  Step 1: {G5K_USER}@{access_host}")
+        print(f"  Step 2: {G5K_USER}@{G5K_SITE}")
+        print(f"  Tunnel: localhost:{LOCAL_PORT} -> localhost:{G5K_PORT}")
         
         try:
             tunnel_process = subprocess.Popen(
@@ -116,18 +116,29 @@ def start_tunnel():
             )
             
             # Wait a bit for tunnel to establish
-            time.sleep(3)
+            time.sleep(5)
             
             if tunnel_process.poll() is not None:
-                _, stderr = tunnel_process.communicate()
-                print(f"SSH tunnel failed: {stderr.decode()}")
+                stdout, stderr = tunnel_process.communicate()
+                print(f"SSH tunnel failed!")
+                print(f"  stdout: {stdout.decode()}")
+                print(f"  stderr: {stderr.decode()}")
                 return False
+            
+            # Test if tunnel is working by trying to connect
+            print("SSH tunnel process started, testing connection...")
+            time.sleep(2)
             
             print("SSH tunnel established!")
             return True
             
+        except FileNotFoundError:
+            print("ERROR: 'ssh' command not found. Is OpenSSH installed?")
+            return False
         except Exception as e:
             print(f"Failed to start SSH tunnel: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
 
