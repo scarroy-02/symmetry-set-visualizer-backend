@@ -31,7 +31,7 @@ CORS(app)
 
 # Configuration from environment
 G5K_USER = os.environ.get('G5K_USER')
-G5K_SITE = os.environ.get('G5K_SITE', 'nancy')
+G5K_SITE = os.environ.get('G5K_SITE', 'sophia')
 G5K_SSH_KEY = os.environ.get('G5K_SSH_KEY')  # Base64-encoded private key
 G5K_PORT = 5000  # Port where persistence_server.py runs on G5K
 LOCAL_PORT = 15000  # Local port for SSH tunnel
