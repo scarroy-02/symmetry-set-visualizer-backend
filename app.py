@@ -1,216 +1,257 @@
 """
-Extended Persistence Server using GUDHI
-Flask server that computes extended persistence for radial filtration on closed curves.
+Render Proxy - Forwards requests to Grid5000 via SSH tunnel.
 
-To run locally:
-    pip install flask flask-cors gudhi numpy
-    python persistence_server.py
+Environment variables (set in Render dashboard):
+    G5K_USER     - Your Grid5000 username
+    G5K_SITE     - Grid5000 site (e.g., 'nancy', 'lyon', 'rennes')  
+    G5K_SSH_KEY  - Base64-encoded SSH private key
 
-The server will run on http://localhost:5000
+Setup:
+    1. Generate SSH key: ssh-keygen -t ed25519 -f g5k_render_key -N ""
+    2. Add public key to G5K: https://api.grid5000.fr/ui/account
+    3. Encode private key: cat g5k_render_key | base64 -w0
+    4. Set G5K_SSH_KEY in Render to the base64 string
 """
 
-from flask import Flask, request, jsonify
+import os
+import sys
+import base64
+import tempfile
+import subprocess
+import threading
+import time
+import atexit
+
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-import numpy as np
-import gudhi as gd
+import requests
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
+
+# Configuration from environment
+G5K_USER = os.environ.get('G5K_USER')
+G5K_SITE = os.environ.get('G5K_SITE', 'nancy')
+G5K_SSH_KEY = os.environ.get('G5K_SSH_KEY')  # Base64-encoded private key
+G5K_PORT = 5000  # Port where persistence_server.py runs on G5K
+LOCAL_PORT = 15000  # Local port for SSH tunnel
+
+# SSH tunnel state
+tunnel_process = None
+tunnel_lock = threading.Lock()
+key_file_path = None
 
 
-def build_simplex_tree(coords, distances, curve_groups):
-    """Build a simplex tree for the curve with given distances."""
-    st = gd.SimplexTree()
-    n = len(coords)
+def setup_ssh_key():
+    """Decode and save SSH key from environment."""
+    global key_file_path
     
-    # Insert vertices
-    for i in range(n):
-        st.insert([i], filtration=float(distances[i]))
+    if not G5K_SSH_KEY:
+        print("ERROR: G5K_SSH_KEY not set")
+        return None
     
-    # Insert edges (closed loops for each curve)
-    for cid, indices in curve_groups.items():
-        m = len(indices)
-        for j in range(m):
-            v1 = indices[j]
-            v2 = indices[(j + 1) % m]
-            f_val = float(max(distances[v1], distances[v2]))
-            st.insert([v1, v2], filtration=f_val)
-    
-    return st
+    try:
+        # Decode base64 key
+        key_content = base64.b64decode(G5K_SSH_KEY).decode('utf-8')
+        
+        # Write to temp file
+        fd, key_file_path = tempfile.mkstemp(prefix='g5k_key_', suffix='.pem')
+        os.write(fd, key_content.encode())
+        os.close(fd)
+        os.chmod(key_file_path, 0o600)
+        
+        print(f"SSH key saved to {key_file_path}")
+        return key_file_path
+    except Exception as e:
+        print(f"ERROR setting up SSH key: {e}")
+        return None
 
 
-def process_extended_persistence(st, infinity_cap):
-    """Compute extended persistence and return categorized diagrams."""
-    st.extend_filtration()
-    dgms = st.extended_persistence()
+def start_tunnel():
+    """Start SSH tunnel to Grid5000."""
+    global tunnel_process
     
-    # dgms[0] -> Ordinary, dgms[1] -> Relative, dgms[2] -> Extended+, dgms[3] -> Extended-
-    ord0, ord1, rel0, rel1, ext0, ext1 = [], [], [], [], [], []
-    
-    for dgm_idx, dgm in enumerate(dgms):
-        for dim, (birth, death) in dgm:
-            is_inf = bool(np.isinf(death))
-            d = float(death) if not is_inf else infinity_cap
-            b = float(birth)
+    with tunnel_lock:
+        # Check if already running
+        if tunnel_process and tunnel_process.poll() is None:
+            return True
+        
+        if not key_file_path:
+            print("ERROR: SSH key not set up")
+            return False
+        
+        if not G5K_USER:
+            print("ERROR: G5K_USER not set")
+            return False
+        
+        # Build SSH command
+        # G5K frontend hostnames: fnancy, flyon, frennes, etc.
+        g5k_frontend = f"f{G5K_SITE}"
+        jump_host = "access.grid5000.fr"
+        
+        cmd = [
+            'ssh',
+            '-N',  # No command, just tunnel
+            '-L', f'{LOCAL_PORT}:localhost:{G5K_PORT}',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'UserKnownHostsFile=/dev/null',
+            '-o', 'ServerAliveInterval=30',
+            '-o', 'ServerAliveCountMax=3',
+            '-o', 'ExitOnForwardFailure=yes',
+            '-o', 'ConnectTimeout=30',
+            '-i', key_file_path,
+            '-J', f'{G5K_USER}@{jump_host}',
+            f'{G5K_USER}@{g5k_frontend}'
+        ]
+        
+        print(f"Starting SSH tunnel to {G5K_SITE}...")
+        print(f"  Command: ssh -J {G5K_USER}@{jump_host} {G5K_USER}@{g5k_frontend}")
+        print(f"  Local port: {LOCAL_PORT} -> remote port: {G5K_PORT}")
+        
+        try:
+            tunnel_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
             
-            if dgm_idx == 0:  # Ordinary
-                (ord0 if dim == 0 else ord1).append([b, d])
-            elif dgm_idx == 1:  # Relative
-                (rel0 if dim == 0 else rel1).append([b, d])
-            else:  # Extended+ (2) and Extended- (3)
-                (ext0 if dim == 0 else ext1).append([b, d])
+            # Wait a bit for tunnel to establish
+            time.sleep(3)
+            
+            if tunnel_process.poll() is not None:
+                _, stderr = tunnel_process.communicate()
+                print(f"SSH tunnel failed: {stderr.decode()}")
+                return False
+            
+            print("SSH tunnel established!")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to start SSH tunnel: {e}")
+            return False
+
+
+def ensure_tunnel():
+    """Ensure SSH tunnel is running, restart if needed."""
+    global tunnel_process
     
-    return ord0, ord1, rel0, rel1, ext0, ext1
+    with tunnel_lock:
+        if tunnel_process and tunnel_process.poll() is None:
+            return True
+    
+    return start_tunnel()
+
+
+def cleanup():
+    """Clean up tunnel and key file on exit."""
+    global tunnel_process, key_file_path
+    
+    if tunnel_process:
+        tunnel_process.terminate()
+        tunnel_process.wait()
+    
+    if key_file_path and os.path.exists(key_file_path):
+        os.remove(key_file_path)
+
+
+atexit.register(cleanup)
+
+
+def proxy_request(path, method='GET', json_data=None, timeout=300):
+    """Forward request through tunnel to G5K server."""
+    if not ensure_tunnel():
+        return {'error': 'SSH tunnel not available. Check G5K_USER and G5K_SSH_KEY.'}, 503
+    
+    url = f'http://localhost:{LOCAL_PORT}{path}'
+    
+    try:
+        if method == 'GET':
+            resp = requests.get(url, timeout=timeout)
+        elif method == 'POST':
+            resp = requests.post(url, json=json_data, timeout=timeout)
+        else:
+            return {'error': f'Unsupported method: {method}'}, 400
+        
+        return resp.json(), resp.status_code
+        
+    except requests.exceptions.Timeout:
+        return {'error': 'Request timed out'}, 504
+    except requests.exceptions.ConnectionError as e:
+        # Tunnel may have died, try to restart
+        print(f"Connection error: {e}")
+        start_tunnel()
+        return {'error': 'Connection to G5K failed. Tunnel restarting.'}, 503
+    except Exception as e:
+        return {'error': str(e)}, 500
+
+
+# ============== Routes ==============
+
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint with status info."""
+    tunnel_ok = ensure_tunnel()
+    return jsonify({
+        'service': 'G5K Persistence Proxy',
+        'g5k_site': G5K_SITE,
+        'g5k_user': G5K_USER or 'NOT SET',
+        'tunnel_status': 'connected' if tunnel_ok else 'disconnected',
+        'endpoints': ['/health', '/persistence', '/vineyard']
+    })
 
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
-    return jsonify({'status': 'ok', 'gudhi_version': gd.__version__})
+    """Health check - proxies to G5K server."""
+    result, status = proxy_request('/health', 'GET')
+    
+    # Add proxy info
+    if isinstance(result, dict):
+        result['proxy'] = 'render'
+        result['g5k_site'] = G5K_SITE
+    
+    return jsonify(result), status
 
 
 @app.route('/persistence', methods=['POST'])
-def compute_persistence():
-    """Compute extended persistence for a single center."""
-    try:
-        data = request.get_json()
-        
-        center = data['center']
-        points = data['points']
-        use_squared = data.get('use_squared_distance', True)
-        
-        cx, cy = center['x'], center['y']
-        n = len(points)
-        
-        if n < 3:
-            return jsonify({'error': 'Need at least 3 points'}), 400
-        
-        # Group points by curve ID
-        curve_groups = {}
-        for i, pt in enumerate(points):
-            cid = pt.get('curveId', 0)
-            if cid not in curve_groups:
-                curve_groups[cid] = []
-            curve_groups[cid].append(i)
-        
-        # Compute distances using numpy
-        coords = np.array([[p['x'], p['y']] for p in points])
-        center_arr = np.array([cx, cy])
-        
-        if use_squared:
-            distances = np.sum((coords - center_arr)**2, axis=1)
-        else:
-            distances = np.linalg.norm(coords - center_arr, axis=1)
-        
-        r_min = float(np.min(distances))
-        r_max = float(np.max(distances))
-        infinity_cap = r_max * 1.5
-        
-        # Build simplex tree and compute
-        st = build_simplex_tree(coords, distances, curve_groups)
-        ord0, ord1, rel0, rel1, ext0, ext1 = process_extended_persistence(st, infinity_cap)
-        
-        return jsonify({
-            'ord0': ord0, 'ord1': ord1,
-            'rel0': rel0, 'rel1': rel1,
-            'ext0': ext0, 'ext1': ext1,
-            'r_min': r_min, 'r_max': r_max
-        })
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+def persistence():
+    """Proxy persistence computation to G5K."""
+    data = request.get_json()
+    result, status = proxy_request('/persistence', 'POST', data)
+    return jsonify(result), status
 
 
 @app.route('/vineyard', methods=['POST'])
-def compute_vineyard():
-    """Compute vineyard (persistence over multiple centers)."""
-    try:
-        data = request.get_json()
-        
-        centers = data['centers']
-        points = data['points']
-        use_squared = data.get('use_squared_distance', True)
-        
-        n = len(points)
-        num_centers = len(centers)
-        
-        if n < 3:
-            return jsonify({'error': 'Need at least 3 points'}), 400
-        
-        # Pre-extract data
-        coords = np.array([[p['x'], p['y']] for p in points])
-        centers_arr = np.array([[c['x'], c['y']] for c in centers])
-        
-        # Group points by curve ID
-        curve_groups = {}
-        for i, pt in enumerate(points):
-            cid = pt.get('curveId', 0)
-            if cid not in curve_groups:
-                curve_groups[cid] = []
-            curve_groups[cid].append(i)
-        
-        # Compute all distances at once (vectorized)
-        # Shape: (num_centers, n)
-        diff = coords[np.newaxis, :, :] - centers_arr[:, np.newaxis, :]
-        if use_squared:
-            all_distances = np.sum(diff**2, axis=2)
-        else:
-            all_distances = np.linalg.norm(diff, axis=2)
-        
-        max_dist_global = float(np.max(all_distances))
-        infinityY = max_dist_global * 1.15
-        
-        # Results
-        ord0_all, ord1_all = [], []
-        rel0_all, rel1_all = [], []
-        ext0_all, ext1_all = [], []
-        
-        for ci in range(num_centers):
-            distances = all_distances[ci]
-            
-            # Build simplex tree
-            st = build_simplex_tree(coords, distances, curve_groups)
-            
-            # Compute extended persistence
-            st.extend_filtration()
-            dgms = st.extended_persistence()
-            
-            # Process diagrams
-            for dgm_idx, dgm in enumerate(dgms):
-                for dim, (birth, death) in dgm:
-                    is_inf = bool(np.isinf(death))
-                    entry = {
-                        'birth': float(birth),
-                        'death': float(death) if not is_inf else infinityY,
-                        'centerIdx': ci,
-                        'isInfinite': is_inf,
-                        'type': ['ord', 'rel', 'ext', 'ext'][dgm_idx]
-                    }
-                    
-                    if dgm_idx == 0:  # Ordinary
-                        (ord0_all if dim == 0 else ord1_all).append(entry)
-                    elif dgm_idx == 1:  # Relative
-                        (rel0_all if dim == 0 else rel1_all).append(entry)
-                    else:  # Extended
-                        (ext0_all if dim == 0 else ext1_all).append(entry)
-        
-        return jsonify({
-            'ord0': ord0_all, 'ord1': ord1_all,
-            'rel0': rel0_all, 'rel1': rel1_all,
-            'ext0': ext0_all, 'ext1': ext1_all,
-            'infinityY': infinityY
-        })
-        
-    except Exception as e:
-        import traceback
-        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+def vineyard():
+    """Proxy vineyard computation to G5K."""
+    data = request.get_json()
+    result, status = proxy_request('/vineyard', 'POST', data, timeout=600)
+    return jsonify(result), status
+
+
+# ============== Startup ==============
+
+def startup():
+    """Run on startup."""
+    print("=" * 50)
+    print("Grid5000 Persistence Proxy")
+    print("=" * 50)
+    print(f"G5K_USER: {G5K_USER or 'NOT SET'}")
+    print(f"G5K_SITE: {G5K_SITE}")
+    print(f"G5K_SSH_KEY: {'SET' if G5K_SSH_KEY else 'NOT SET'}")
+    print()
+    
+    if G5K_USER and G5K_SSH_KEY:
+        setup_ssh_key()
+        start_tunnel()
+    else:
+        print("WARNING: Missing G5K credentials. Set G5K_USER and G5K_SSH_KEY.")
+
+
+# Run startup
+startup()
 
 
 if __name__ == '__main__':
-    print("Starting Extended Persistence Server...")
-    print("Endpoints:")
-    print("  GET  /health     - Health check")
-    print("  POST /persistence - Single center persistence")
-    print("  POST /vineyard    - Vineyard computation")
-    print()
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
