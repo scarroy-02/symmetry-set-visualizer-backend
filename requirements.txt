@@ -1,0 +1,4 @@
+gudhi
+flask
+flask_cors
+gunicorn
